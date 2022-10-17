@@ -6,7 +6,16 @@ This is the official implementation of the IndexNet.
 
 ## Code
 
-coming soon....
++ Code for building model: `IndexNetModel`
++ Code for data dataset、augmentation: `dataset`
++ Implementation of Deeplabv3+ segmentation model:`deeplabv3plus`
++ Other utils: `utils`
++ PyTorch-Lightning Model: `trainer.py`
++ Config: `config.py`
+
+### Reference
+
+Many Thanks to: [solo-learn](https://github.com/vturrisi/solo-learn)、[DetCon](https://github.com/deepmind/detcon)、[Pytorch-BYOL](https://github.com/sthalles/PyTorch-BYOL)
 
 ## Pre-trained model
 
