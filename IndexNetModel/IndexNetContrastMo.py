@@ -6,6 +6,27 @@ from einops import rearrange
 import torch.nn.functional as F
 
 
+def linear_loss(p: torch.Tensor, z: torch.Tensor, simplified: bool = True) -> torch.Tensor:
+    """Computes BYOL's loss given batch of predicted features p and projected momentum features z.
+
+    Args:
+        p (torch.Tensor): NxD Tensor containing predicted features from view 1
+        z (torch.Tensor): NxD Tensor containing projected momentum features from view 2
+        simplified (bool): faster computation, but with same result. Defaults to True.
+
+    Returns:
+        torch.Tensor: BYOL's loss.
+    """
+
+    if simplified:
+        return 2 - 2 * F.cosine_similarity(p, z.detach(), dim=-1).mean()
+
+    p = F.normalize(p, dim=-1)
+    z = F.normalize(z, dim=-1)
+
+    return 2 - 2 * (p * z.detach()).sum(dim=1).mean()
+
+
 @torch.no_grad()
 def initialize_momentum_params(online_net: nn.Module, momentum_net: nn.Module):
     params_online = online_net.parameters()
@@ -117,27 +138,36 @@ class MLP(nn.Module):
         super(MLP, self).__init__()
         self.avgpool = nn.AdaptiveAvgPool2d(1)
         self.mode = mode
+        self.head = nn.ModuleList()
+
         if self.mode == "projector":
-            self.net = nn.Sequential(
-                nn.Linear(hidden_dim // 2, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Linear(hidden_dim, out_dim)
-            )
+            for hidden in hidden_dim:
+                layer = nn.Sequential(
+                    nn.Linear(hidden // 2, hidden),
+                    nn.BatchNorm1d(hidden),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(hidden, out_dim)
+                )
+                self.head.append(layer)
         else:
-            self.net = nn.Sequential(
-                nn.Linear(out_dim, out_dim * 2),
-                nn.BatchNorm1d(out_dim * 2),
-                nn.ReLU(inplace=True),
-                nn.Linear(out_dim * 2, out_dim)
-            )
+            for _ in range(len(hidden_dim)):
+                layer = nn.Sequential(
+                    nn.Linear(out_dim, out_dim * 2),
+                    nn.BatchNorm1d(out_dim * 2),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(out_dim * 2, out_dim)
+                )
+                self.head.append(layer)
 
     def forward(self, feature_list):
+        result = []
         if self.mode == "projector":
-            feature = self.avgpool(feature_list[0]).squeeze()
+            feature = [self.avgpool(i).squeeze() for i in feature_list]
         else:
             feature = feature_list
-        return self.net(feature)
+        for head, feat in zip(self.head, feature):
+            result.append(head(feat))
+        return result
 
 
 class NetWrapper(nn.Module):
@@ -146,12 +176,14 @@ class NetWrapper(nn.Module):
                  hidden_dim_list,
                  out_dim,
                  backbone_stage=[1, 2, 3, 4],
-                 no_index_head=False):
+                 no_index_head=False,
+                 with_global: bool = True):
         super(NetWrapper, self).__init__()
         self.hidden_dim = hidden_dim_list
         self.out_dim = out_dim
         self.backbone_stage = backbone_stage
         self.no_index_head = no_index_head
+        self.with_global = with_global
 
         self.net = resnet.__dict__[net](outstride=32, pretrained=False)
         if no_index_head:
@@ -160,12 +192,17 @@ class NetWrapper(nn.Module):
             self.projector = PyramidConvMLP(hidden_dim_list=hidden_dim_list,
                                             out_dim=out_dim,
                                             mode="projector")
+        
+        if with_global:
+            self.linear_projector = MLP(self.hidden_dim, self.out_dim, mode="projector")
 
     def forward(self, img):
         feature_list = self.net(img)
         out_feature = []
+        linear_features = []
         for i in self.backbone_stage:
             out_feature.append(feature_list[i - 1])
+            linear_features.append(feature_list[i - 1])
 
         if self.no_index_head:
             return self.projector(out_feature)
@@ -175,7 +212,8 @@ class NetWrapper(nn.Module):
             out_feature[stage] = feature
 
         out_feature = self.projector(out_feature)
-        return out_feature
+        linear_feature = self.linear_projector(linear_features)
+        return out_feature, linear_feature
 
 
 class IndexNet(nn.Module):
@@ -192,12 +230,14 @@ class IndexNet(nn.Module):
             self.online_encoder = NetWrapper(net=config.network.backbone,
                                              hidden_dim_list=[config.nework.head_hidden_dim[-1]],
                                              out_dim=config.network.head_out_dim,
-                                             backbone_stage=[4]
+                                             backbone_stage=[4],
+                                             with_global=True,
                                              )
             self.momentum_encoder =NetWrapper(net=config.network.backbone,
                                              hidden_dim_list=[config.nework.head_hidden_dim[-1]],
                                              out_dim=config.network.head_out_dim,
-                                             backbone_stage=[4]
+                                             backbone_stage=[4],
+                                             with_global=True,
                                              )
             self.predictor = PyramidConvMLP(config.network.head_hidden_dim,
                                             config.network.head_out_dim,
@@ -228,6 +268,11 @@ class IndexNet(nn.Module):
             self.predictor = PyramidConvMLP(config.network.head_hidden_dim,
                                             config.network.head_out_dim,
                                             mode="predictor")
+        
+        if config.with_global:
+            self.linear_predictor = MLP(config.network.head_hidden_dim,
+                                        config.network.head.out_dim,
+                                        mode="predictor")
 
         initialize_momentum_params(self.online_encoder, self.momentum_encoder)
         self.ema = MomentumUpdater(self.base_momentum, self.final_momentum)
@@ -245,15 +290,22 @@ class IndexNet(nn.Module):
 
     @torch.no_grad()
     def momentum_forward(self, img1, img2):
-        feature_list_k1 = self.momentum_encoder(img1)
-        feature_list_k2 = self.momentum_encoder(img2)
+        feature_index_k1, feature_linear_k1 = self.momentum_encoder(img1)
+        feature_index_k2, feature_linear_k2 = self.momentum_encoder(img2)
 
-        return feature_list_k1, feature_list_k2
+        return feature_index_k1, feature_index_k2, feature_linear_k1, feature_linear_k2
 
     def forward(self, img1, img2):
-        feature_list_q1 = self.predictor(self.online_encoder(img1))
-        feature_list_q2 = self.predictor(self.online_encoder(img2))
+        feature_index_q1, feature_linear_q1 = self.online_encoder(img1)
+        feature_index_q2, feature_linear_q2 = self.online_encoder(img2)
 
-        feature_list_k1, feature_list_k2 = self.momentum_forward(img1, img2)
-        return feature_list_q1, feature_list_q2, feature_list_k1, feature_list_k2
+        feature_index_list_q1 = self.predictor(feature_index_q1)
+        feature_index_list_q2  = self.predictor(feature_index_q2)
+
+        feature_linear_list_q1 = self.linear_predictor(feature_linear_q1)
+        feature_linear_list_q2 = self.linear_predictor(feature_linear_q2)
+        
+        feature_index_k1, feature_index_k2, feature_linear_k1, feature_linear_k2 = self.momentum_forward(img1, img2)
+        return feature_index_list_q1, feature_index_list_q2, feature_linear_list_q1, feature_linear_list_q2, \
+                feature_index_k1, feature_index_k2, feature_linear_k1, feature_linear_k2
 

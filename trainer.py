@@ -2,7 +2,7 @@ import torch
 from functools import partial
 import pytorch_lightning as pl
 from typing import Callable, Sequence
-from IndexNetModel.IndexNetContrastMo import IndexNet, conv_loss
+from IndexNetModel.IndexNetContrastMo import IndexNet, conv_loss, linear_loss
 from torch.optim.lr_scheduler import CosineAnnealingLR, MultiStepLR
 from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 
@@ -26,6 +26,7 @@ class IndexNetTrainer(pl.LightningModule):
         self.max_epochs = config.schedule.epochs
         self.loss_weight = config.network.loss_weight_alpha
         self.spatial_dimension = config.network.spatial_dimension
+        self.with_global = config.with_global
 
         if self.scheduler is not None:
             self.min_lr = config.schedule.min_lr
@@ -97,12 +98,22 @@ class IndexNetTrainer(pl.LightningModule):
     def training_step(self, imges_dict, batch_idx):
         img1 = imges_dict["img1"]
         img2 = imges_dict["img2"]
-        pred1, pred2, mo_feat1, mo_feat2 = self(img1, img2)
+
+        loss = 0
+
+        if self.with_global:
+            pred1, pred2, mo_feat1, mo_feat2, linear_pred_1, linear_pred_2, mo_linear_feat1, mo_linear_feat2 = self(img1, img2)
+            for stage, (q1, k2) in enumerate(zip(linear_pred_1, mo_linear_feat2)):
+                loss += linear_loss(q1, k2)
+
+            for stage, (q2, k1) in enumerate(zip(linear_pred_2, mo_linear_feat1)):
+                loss += linear_loss(q2, k1)
+        else:
+            pred1, pred2, mo_feat1, mo_feat2 = self(img1, img2)
 
         mask1 = imges_dict["mask1"]
         mask2 = imges_dict["mask2"]
 
-        loss = 0
 
         for stage, (feature_q, feature_k) in enumerate(zip(pred1, mo_feat2)):
             loss += conv_loss(feature_q, feature_k, mask1, mask2,
